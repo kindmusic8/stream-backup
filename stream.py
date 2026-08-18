@@ -8,14 +8,13 @@ from datetime import datetime
 
 
 PHOTO_DIR = "photos"
+PHOTO_LOCK_SECONDS = 1.0
 # 若畫面顏色正常可改成 False；若黃變藍請維持 True
 FRAME_IS_RGB = True
 TARGET_MARKER_IDS = [0, 4, 5, 1, 2, 6, 7, 3]
 TRANSITION_MODES = ["DOWN", "NEXT", "UP", "NEXT", "DOWN", "NEXT", "UP"]
 USE_POSE_CONTROL = True
 SEARCH_YAW_SPEED = -20
-NEXT_FACE_RIGHT_SPEED = 18
-NEXT_FACE_LEFT_YAW_SPEED = -18
 SAME_FACE_DOWN_SPEED = -18
 SAME_FACE_UP_SPEED = 18
 REACQUIRE_MAX_AGE_SEC = 1.2
@@ -43,10 +42,15 @@ TOWER_MARKER_VERTICAL_SPACING_CM = 18.0
 TOWER_DISPLAY_X_SIGN = 1.0
 TOWER_WAYPOINT_TOLERANCE_CM = 12.0
 TOWER_HEADING_TOLERANCE_DEG = 12.0
+TOWER_ARC_TOLERANCE_CM = 16.0
+TOWER_ARC_HEADING_TOLERANCE_DEG = 18.0
+TOWER_WAYPOINT_SOFT_TIMEOUT_SEC = 6.0
+TOWER_WAYPOINT_SOFT_DISTANCE_CM = 28.0
+TOWER_WAYPOINT_SOFT_HEADING_DEG = 30.0
 TOWER_WAYPOINT_YAW_SCALE = 0.35
 TOWER_YAW_SIGN = -1  # 塔座標角度逆時針為正；Tello RC yaw 的正方向相反。
-TARGET_ACQUIRE_RIGHT_SPEED = 10
-TARGET_ACQUIRE_YAW_SPEED = -10
+TARGET_ACQUIRE_YAW_SPEED = 8
+NAVIGATION_BLIND_MAX_SEC = 0.6
 POSE_X_TOLERANCE_CM = 8.0
 POSE_Y_TOLERANCE_CM = 8.0
 POSE_Z_TOLERANCE_CM = 10.0
@@ -194,27 +198,64 @@ def _unit_vector_from_degrees(angle_deg):
     return np.array([np.cos(angle_rad), np.sin(angle_rad)], dtype=np.float32)
 
 
-def estimate_tower_pose(marker_id, pose_x_cm, pose_z_cm, marker_yaw):
-    marker_info = TOWER_MARKER_MAP.get(marker_id)
-    if (
-        marker_info is None
-        or pose_x_cm is None
-        or pose_z_cm is None
-        or marker_yaw is None
-    ):
-        return None
-
+def _marker_to_tower_rotation(marker_info):
     normal_vec = _unit_vector_from_degrees(marker_info["normal_deg"])
     right_vec = _unit_vector_from_degrees(marker_info["normal_deg"] + 90.0)
-    marker_pos = np.array([marker_info["x_cm"], marker_info["z_cm"]], dtype=np.float32)
-    drone_pos = marker_pos + right_vec * pose_x_cm + normal_vec * pose_z_cm
-    target_pos = marker_pos + normal_vec * TARGET_Z_CM
-    target_error = target_pos - drone_pos
-    heading_deg = _normalize_angle_degrees(marker_info["normal_deg"] + 180.0 + marker_yaw)
+    return np.array(
+        [
+            [right_vec[0], 0.0, normal_vec[0]],
+            [0.0, 1.0, 0.0],
+            [right_vec[1], 0.0, normal_vec[1]],
+        ],
+        dtype=np.float64,
+    )
+
+
+def estimate_tower_pose(marker_id, rvec, tvec):
+    marker_info = TOWER_MARKER_MAP.get(marker_id)
+    if marker_info is None or rvec is None or tvec is None:
+        return None
+
+    marker_to_camera, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64))
+    camera_in_marker_cm = (
+        -marker_to_camera.T @ np.asarray(tvec, dtype=np.float64).reshape(3, 1)
+    ).reshape(3) * 100.0
+
+    marker_to_tower = _marker_to_tower_rotation(marker_info)
+    marker_pos = np.array(
+        [
+            marker_info["x_cm"],
+            marker_info["vertical_cm"],
+            marker_info["z_cm"],
+        ],
+        dtype=np.float64,
+    )
+    drone_pos = marker_pos + marker_to_tower @ camera_in_marker_cm
+
+    # R.T 將相機座標轉回 marker 座標，再轉進塔座標。
+    camera_to_tower = marker_to_tower @ marker_to_camera.T
+    camera_forward_tower = camera_to_tower @ np.array([0.0, 0.0, 1.0])
+    horizontal_forward = np.hypot(
+        camera_forward_tower[0],
+        camera_forward_tower[2],
+    )
+    if horizontal_forward < 1e-6:
+        return None
+
+    heading_deg = _normalize_angle_degrees(
+        np.degrees(
+            np.arctan2(camera_forward_tower[2], camera_forward_tower[0])
+        )
+    )
+    normal_vec = _unit_vector_from_degrees(marker_info["normal_deg"])
+    target_pos = np.array([marker_info["x_cm"], marker_info["z_cm"]])
+    target_pos = target_pos + normal_vec * TARGET_Z_CM
+    target_error = target_pos - drone_pos[[0, 2]]
 
     return {
         "tower_x_cm": float(drone_pos[0]),
-        "tower_z_cm": float(drone_pos[1]),
+        "tower_y_cm": float(drone_pos[1]),
+        "tower_z_cm": float(drone_pos[2]),
         "display_tower_x_cm": float(drone_pos[0] * TOWER_DISPLAY_X_SIGN),
         "heading_deg": heading_deg,
         "target_x_cm": float(target_pos[0]),
@@ -243,6 +284,60 @@ def tower_marker_target_position(marker_id):
     }
 
 
+def build_tower_transition_waypoints(from_marker_id, to_marker_id):
+    from_info = TOWER_MARKER_MAP.get(from_marker_id)
+    to_info = TOWER_MARKER_MAP.get(to_marker_id)
+    target = tower_marker_target_position(to_marker_id)
+    if from_info is None or to_info is None or target is None:
+        return []
+
+    if from_info["face"] == to_info["face"]:
+        return [dict(target, label="SAME")]
+
+    next_face = from_info["face"] % 4 + 1
+    if to_info["face"] != next_face:
+        return [dict(target, label="DIRECT")]
+
+    half_front = TOWER_FRONT_BACK_WIDTH_CM / 2.0
+    half_side = TOWER_LEFT_RIGHT_WIDTH_CM / 2.0
+    corner_by_face = {
+        1: (half_front, -half_side),
+        2: (half_front, half_side),
+        3: (-half_front, half_side),
+        4: (-half_front, -half_side),
+    }
+    start_angle = from_info["normal_deg"]
+    end_angle = start_angle + 90.0
+    corner_x, corner_z = corner_by_face[from_info["face"]]
+
+    waypoints = []
+    for index, fraction in enumerate((0.25, 0.75)):
+        angle = start_angle + (end_angle - start_angle) * fraction
+        offset = _unit_vector_from_degrees(angle) * TARGET_Z_CM
+        waypoints.append(
+            {
+                "x_cm": float(corner_x + offset[0]),
+                "z_cm": float(corner_z + offset[1]),
+                "heading_deg": _normalize_angle_degrees(angle + 180.0),
+                "face": to_info["face"],
+                "row": to_info["row"],
+                "label": f"ARC{index + 1}",
+                "position_tolerance_cm": TOWER_ARC_TOLERANCE_CM,
+                "heading_tolerance_deg": TOWER_ARC_HEADING_TOLERANCE_DEG,
+            }
+        )
+
+    waypoints.append(
+        dict(
+            target,
+            label="FACE",
+            position_tolerance_cm=TOWER_ARC_TOLERANCE_CM,
+            heading_tolerance_deg=TOWER_ARC_HEADING_TOLERANCE_DEG,
+        )
+    )
+    return waypoints
+
+
 def tower_error_to_body_error(tower_error_x, tower_error_z, heading_deg):
     heading_rad = np.radians(heading_deg)
     right_vec = np.array([np.sin(heading_rad), -np.cos(heading_rad)], dtype=np.float32)
@@ -252,14 +347,7 @@ def tower_error_to_body_error(tower_error_x, tower_error_z, heading_deg):
 
 
 def _normalize_angle_degrees(angle):
-    def normalize(angle):
-        if angle > 180.0:
-            return angle - 360.0
-        if angle < -180.0:
-            return angle + 360.0
-        return angle
-
-    return float(normalize(angle))
+    return float((angle + 180.0) % 360.0 - 180.0)
 
 
 def _rotation_matrix_to_yaw_degrees(rotation_matrix):
@@ -303,7 +391,7 @@ def _detect_aruco_detail(img, target_id=None):
 
     # 若沒有偵測到 marker
     if ids is None or len(ids) == 0:
-        return None, None, None, None, None, None, None, None, None
+        return (None,) * 11
 
     # 在顯示畫面上畫出 marker 框線
     cv2.aruco.drawDetectedMarkers(img, corners, ids)
@@ -314,7 +402,7 @@ def _detect_aruco_detail(img, target_id=None):
         flat_ids = ids.flatten()
         matches = np.where(flat_ids == target_id)[0]
         if len(matches) == 0:
-            return None, None, None, None, None, None, None, None, None
+            return (None,) * 11
         marker_index = int(matches[0])
 
     first_corners = corners[marker_index][0]  # shape: (4, 2)
@@ -341,6 +429,8 @@ def _detect_aruco_detail(img, target_id=None):
     pose_x_cm = None
     pose_y_cm = None
     pose_z_cm = None
+    pose_rvec = None
+    pose_tvec = None
     half_len = MARKER_LENGTH_M / 2.0
     object_points = np.array(
         [
@@ -367,6 +457,8 @@ def _detect_aruco_detail(img, target_id=None):
             pose_x_cm = float(tvec[0][0] * 100.0)
             pose_y_cm = float(tvec[1][0] * 100.0)
             pose_z_cm = float(tvec[2][0] * 100.0)
+            pose_rvec = rvec.copy()
+            pose_tvec = tvec.copy()
 
             if SHOW_POSE_AXES and hasattr(cv2, "drawFrameAxes"):
                 cv2.drawFrameAxes(
@@ -382,6 +474,8 @@ def _detect_aruco_detail(img, target_id=None):
         pose_x_cm = None
         pose_y_cm = None
         pose_z_cm = None
+        pose_rvec = None
+        pose_tvec = None
 
     return (
         error_x,
@@ -393,19 +487,23 @@ def _detect_aruco_detail(img, target_id=None):
         pose_x_cm,
         pose_y_cm,
         pose_z_cm,
+        pose_rvec,
+        pose_tvec,
     )
 
 
 def find_aruco(img):
     # 依需求提供的基礎函式：只回傳 error_x, error_y, marker_id
     # 內部仍沿用同一套偵測流程與畫框邏輯
-    error_x, error_y, marker_id, _, _, _, _, _, _ = _detect_aruco_detail(img)
+    error_x, error_y, marker_id, _, _, _, _, _, _, _, _ = _detect_aruco_detail(img)
     if marker_id is None:
         return None, None, None
     return error_x, error_y, marker_id
 
 
-def reset_tracker_state(state):
+def reset_tracker_state(state, preserve_command=False):
+    previous_command = state.get("last_cmd", (0, 0, 0, 0))
+    previous_command_ts = state.get("last_cmd_ts", 0.0)
     state["filtered_area"] = None
     state["filtered_ex"] = 0.0
     state["filtered_ey"] = 0.0
@@ -417,6 +515,10 @@ def reset_tracker_state(state):
     state["last_cmd"] = (0, 0, 0, 0)
     state["lock_start_ts"] = None
     state["last_pid_ts"] = None
+
+    if preserve_command:
+        state["last_cmd"] = previous_command
+        state["last_cmd_ts"] = previous_command_ts
 
     for pid in state.get("pids", {}).values():
         pid.reset()
@@ -694,6 +796,14 @@ def fly_tower_waypoint(tello, tower_pose, target_position, state, visible_error_
     heading_error = _normalize_angle_degrees(
         target_position["heading_deg"] - tower_pose["heading_deg"]
     )
+    position_tolerance = target_position.get(
+        "position_tolerance_cm",
+        TOWER_WAYPOINT_TOLERANCE_CM,
+    )
+    heading_tolerance = target_position.get(
+        "heading_tolerance_deg",
+        TOWER_HEADING_TOLERANCE_DEG,
+    )
     body_lr_error, body_fb_error = tower_error_to_body_error(
         error_x,
         error_z,
@@ -706,24 +816,34 @@ def fly_tower_waypoint(tello, tower_pose, target_position, state, visible_error_
     state["last_pid_ts"] = now
 
     pids = state["pids"]
+    waypoint_key = (
+        round(target_position["x_cm"], 1),
+        round(target_position["z_cm"], 1),
+        round(target_position["heading_deg"], 1),
+    )
+    if state.get("waypoint_key") != waypoint_key:
+        state["waypoint_key"] = waypoint_key
+        state["waypoint_start_ts"] = now
+    waypoint_elapsed = now - state.get("waypoint_start_ts", now)
+
     lr_velocity = 0
     fb_velocity = 0
     yaw_velocity = 0
-    if abs(body_lr_error) > TOWER_WAYPOINT_TOLERANCE_CM:
+    if abs(body_lr_error) > position_tolerance:
         lr_velocity = POSE_LR_SIGN * _rc_speed(pids["x"].update(body_lr_error, dt))
     else:
         pids["x"].reset()
 
-    if abs(body_fb_error) > TOWER_WAYPOINT_TOLERANCE_CM:
+    if abs(body_fb_error) > position_tolerance:
         fb_velocity = POSE_FB_SIGN * _rc_speed(pids["z"].update(body_fb_error, dt))
     else:
         pids["z"].reset()
 
     position_reached = (
-        abs(error_x) <= TOWER_WAYPOINT_TOLERANCE_CM
-        and abs(error_z) <= TOWER_WAYPOINT_TOLERANCE_CM
+        abs(error_x) <= position_tolerance
+        and abs(error_z) <= position_tolerance
     )
-    if abs(heading_error) > TOWER_HEADING_TOLERANCE_DEG:
+    if abs(heading_error) > heading_tolerance:
         yaw_velocity = TOWER_YAW_SIGN * _rc_speed(
             pids["yaw"].update(heading_error, dt) * TOWER_WAYPOINT_YAW_SCALE,
             min_speed=6,
@@ -731,14 +851,17 @@ def fly_tower_waypoint(tello, tower_pose, target_position, state, visible_error_
     else:
         pids["yaw"].reset()
 
-    # 導航途中才保護目前可見的定位 marker。到達拍照點後必須允許它離開
-    # 畫面，否則會阻止機身轉向下一面。
+    # 舊 marker 接近邊緣時可以協助減速，但不能反轉 waypoint 要求的旋轉。
     if (
         not position_reached
         and visible_error_x is not None
         and abs(visible_error_x) >= X_EDGE_GUARD
     ):
-        yaw_velocity = 8 if visible_error_x > 0 else -8
+        edge_yaw = 8 if visible_error_x > 0 else -8
+        if yaw_velocity == 0 or edge_yaw * yaw_velocity > 0:
+            yaw_velocity = edge_yaw
+        else:
+            yaw_velocity = int(np.sign(yaw_velocity) * max(4, abs(yaw_velocity) // 2))
 
     pids["y"].reset()
     if now - state["last_cmd_ts"] >= 0.08:
@@ -746,9 +869,53 @@ def fly_tower_waypoint(tello, tower_pose, target_position, state, visible_error_
         state["last_cmd_ts"] = now
 
     tello.send_rc_control(*state["last_cmd"])
-    reached = position_reached and abs(heading_error) <= TOWER_HEADING_TOLERANCE_DEG
+    reached = position_reached and abs(heading_error) <= heading_tolerance
+    soft_reached = (
+        waypoint_elapsed >= TOWER_WAYPOINT_SOFT_TIMEOUT_SEC
+        and np.hypot(error_x, error_z) <= TOWER_WAYPOINT_SOFT_DISTANCE_CM
+        and abs(heading_error) <= TOWER_WAYPOINT_SOFT_HEADING_DEG
+    )
+    reached = reached or soft_reached
     errors = (error_x, error_z, body_lr_error, body_fb_error, heading_error)
     return errors, state["last_cmd"], reached
+
+
+def search_for_transition_target(tello, transition_mode, acquire_start_ts):
+    if transition_mode == "DOWN":
+        command = (0, 0, SAME_FACE_DOWN_SPEED, 0)
+    elif transition_mode == "UP":
+        command = (0, 0, SAME_FACE_UP_SPEED, 0)
+    else:
+        elapsed = max(0.0, time.monotonic() - acquire_start_ts)
+        sweep_phase = elapsed % 3.2
+        if sweep_phase < 1.2:
+            yaw_velocity = -TARGET_ACQUIRE_YAW_SPEED
+        elif sweep_phase < 2.4:
+            yaw_velocity = TARGET_ACQUIRE_YAW_SPEED
+        else:
+            yaw_velocity = -TARGET_ACQUIRE_YAW_SPEED
+        command = (0, 0, 0, yaw_velocity)
+
+    tello.send_rc_control(*command)
+    return command
+
+
+def continue_navigation_blind(tello, state, transition_mode):
+    last_seen_ts = state.get("last_seen_ts")
+    age = float("inf") if last_seen_ts is None else time.monotonic() - last_seen_ts
+
+    if transition_mode == "DOWN":
+        command = (0, 0, SAME_FACE_DOWN_SPEED, 0)
+    elif transition_mode == "UP":
+        command = (0, 0, SAME_FACE_UP_SPEED, 0)
+    elif age <= NAVIGATION_BLIND_MAX_SEC:
+        command = tuple(int(np.clip(value, -10, 10)) for value in state["last_cmd"])
+    else:
+        # 定位完全消失時停止平移，只向既定繞塔方向慢慢掃描任一 marker。
+        command = (0, 0, 0, -TARGET_ACQUIRE_YAW_SPEED)
+
+    tello.send_rc_control(*command)
+    return command
 
 
 def pulse_rc(tello, lr, fb, ud, yaw, duration=0.16):
@@ -826,12 +993,15 @@ def main() -> None:
     tello = Tello()
     is_flying = False
     auto_track = False
-    target_takeoff_up_cm = 70
+    target_takeoff_up_cm = 30
     current_target_index = 0
     inspection_done = False
     moving_to_next_face = False
     transition_mode = "SCAN"
     transition_phase = "SCAN"
+    transition_waypoints = []
+    transition_waypoint_index = 0
+    acquire_start_ts = None
 
     tracker_state = {
         "filtered_area": None,
@@ -850,6 +1020,8 @@ def main() -> None:
         "last_seen_error_y": 0,
         "last_seen_marker_id": None,
         "last_tower_pose": None,
+        "waypoint_key": None,
+        "waypoint_start_ts": None,
         "lock_start_ts": None,
         "photo_taken": False,
         "pids": {
@@ -901,6 +1073,28 @@ def main() -> None:
             # display_frame: 顯示/偵測用
             frame = cv2.resize(raw_frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
             fallback_detection_frame = frame.copy()
+            detection = _detect_aruco_detail(frame, current_target_id)
+            marker_id = detection[2]
+            if (
+                marker_id is None
+                and moving_to_next_face
+                and transition_phase == "NAVIGATE"
+            ):
+                preferred_id = tracker_state.get("last_seen_marker_id")
+                if preferred_id is not None and preferred_id != current_target_id:
+                    preferred_frame = fallback_detection_frame.copy()
+                    preferred_detection = _detect_aruco_detail(
+                        preferred_frame,
+                        preferred_id,
+                    )
+                    if preferred_detection[2] is not None:
+                        detection = preferred_detection
+                        frame = preferred_frame
+
+                if detection[2] is None:
+                    detection = _detect_aruco_detail(fallback_detection_frame)
+                    frame = fallback_detection_frame
+
             (
                 error_x,
                 error_y,
@@ -911,29 +1105,13 @@ def main() -> None:
                 pose_x_cm,
                 pose_y_cm,
                 pose_z_cm,
-            ) = _detect_aruco_detail(frame, current_target_id)
-            if (
-                marker_id is None
-                and moving_to_next_face
-                and transition_phase == "NAVIGATE"
-            ):
-                (
-                    error_x,
-                    error_y,
-                    marker_id,
-                    marker_area,
-                    marker_yaw,
-                    marker_pitch,
-                    pose_x_cm,
-                    pose_y_cm,
-                    pose_z_cm,
-                ) = _detect_aruco_detail(fallback_detection_frame)
-                frame = fallback_detection_frame
+                pose_rvec,
+                pose_tvec,
+            ) = detection
             tower_pose = estimate_tower_pose(
                 marker_id,
-                pose_x_cm,
-                pose_z_cm,
-                marker_yaw,
+                pose_rvec,
+                pose_tvec,
             )
 
             # 畫中心十字
@@ -951,17 +1129,18 @@ def main() -> None:
 
             # 顯示辨識資訊 (只在 display frame)
             if marker_id is not None:
-                yaw_text = f"{marker_yaw:.1f}" if marker_yaw is not None else "N/A"
                 z_text = f"{pose_z_cm:.0f}" if pose_z_cm is not None else "N/A"
                 tower_text = "T:N/A"
+                heading_text = "H:N/A"
                 if tower_pose is not None:
                     tower_text = (
                         f"T:{tower_pose['display_tower_x_cm']:.0f},"
                         f"{tower_pose['tower_z_cm']:.0f}"
                     )
+                    heading_text = f"H:{tower_pose['heading_deg']:.0f}"
                 cv2.putText(
                     frame,
-                    f"ID:{marker_id} z:{z_text} yaw:{yaw_text} {tower_text}",
+                    f"ID:{marker_id} d:{z_text} {tower_text} {heading_text}",
                     (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
@@ -982,6 +1161,11 @@ def main() -> None:
             mode_name = "AUTO" if auto_track else "MANUAL"
             face_text = "DONE" if inspection_done else f"{current_target_index + 1}/{len(TARGET_MARKER_IDS)}"
             search_text = transition_phase if moving_to_next_face else "SCAN"
+            if transition_phase == "NAVIGATE" and transition_waypoints:
+                search_text = (
+                    f"NAV {transition_waypoint_index + 1}/"
+                    f"{len(transition_waypoints)}"
+                )
             status_text = (
                 f"{mode_name} {face_text} target:{current_target_id} {search_text}"
             )
@@ -1005,10 +1189,16 @@ def main() -> None:
                     using_tower_waypoint = (
                         moving_to_next_face
                         and transition_phase == "NAVIGATE"
-                        and marker_id != current_target_id
                     )
                     if using_tower_waypoint:
-                        target_position = tower_marker_target_position(current_target_id)
+                        if transition_waypoints:
+                            safe_waypoint_index = min(
+                                transition_waypoint_index,
+                                len(transition_waypoints) - 1,
+                            )
+                            target_position = transition_waypoints[safe_waypoint_index]
+                        else:
+                            target_position = tower_marker_target_position(current_target_id)
                         waypoint_errors, waypoint_cmd, waypoint_reached = fly_tower_waypoint(
                             tello,
                             tower_pose,
@@ -1021,7 +1211,7 @@ def main() -> None:
                         else:
                             err_x, err_z, body_lr, body_fb, heading_error = waypoint_errors
                             control_text = (
-                                f"TOWER to ID:{current_target_id} "
+                                f"LOC:{marker_id} {target_position.get('label', 'WP')} "
                                 f"e:{err_x:.0f},{err_z:.0f} "
                                 f"h:{heading_error:.0f}"
                             )
@@ -1035,23 +1225,23 @@ def main() -> None:
                             2,
                         )
                         if waypoint_reached:
-                            transition_phase = "ACQUIRE"
-                            tracker_state["last_seen_ts"] = None
-                            tracker_state["last_seen_marker_id"] = None
-                            if transition_mode == "DOWN":
-                                tello.send_rc_control(0, 0, SAME_FACE_DOWN_SPEED, 0)
-                            elif transition_mode == "UP":
-                                tello.send_rc_control(0, 0, SAME_FACE_UP_SPEED, 0)
+                            transition_waypoint_index += 1
+                            reset_tracker_state(tracker_state)
+                            if transition_waypoint_index < len(transition_waypoints):
+                                tello.send_rc_control(0, 0, 0, 0)
                             else:
-                                tello.send_rc_control(
-                                    TARGET_ACQUIRE_RIGHT_SPEED,
-                                    0,
-                                    0,
-                                    TARGET_ACQUIRE_YAW_SPEED,
+                                transition_phase = "ACQUIRE"
+                                acquire_start_ts = time.monotonic()
+                                tracker_state["last_seen_ts"] = None
+                                tracker_state["last_seen_marker_id"] = None
+                                search_for_transition_target(
+                                    tello,
+                                    transition_mode,
+                                    acquire_start_ts,
                                 )
                             cv2.putText(
                                 frame,
-                                f"WAYPOINT NEAR: scan ID {current_target_id}",
+                                f"WP {transition_waypoint_index}/{len(transition_waypoints)}",
                                 (10, 100),
                                 cv2.FONT_HERSHEY_SIMPLEX,
                                 0.55,
@@ -1062,6 +1252,9 @@ def main() -> None:
                         moving_to_next_face = False
                         transition_mode = "SCAN"
                         transition_phase = "SCAN"
+                        transition_waypoints = []
+                        transition_waypoint_index = 0
+                        acquire_start_ts = None
                         if USE_POSE_CONTROL:
                             x_cm, y_cm, z_cm, pose_errors, is_locked = track_marker_with_pose(
                                 tello,
@@ -1117,7 +1310,7 @@ def main() -> None:
                             2,
                         )
 
-                        # 鎖定懸停連續 3 秒後自動拍照 (僅拍一次，直到 marker 遺失或重啟)
+                        # 鎖定懸停達指定時間後自動拍照。
                         if is_locked:
                             if tracker_state["lock_start_ts"] is None:
                                 tracker_state["lock_start_ts"] = time.monotonic()
@@ -1125,14 +1318,17 @@ def main() -> None:
                                 hold_time = time.monotonic() - tracker_state["lock_start_ts"]
                                 cv2.putText(
                                     frame,
-                                    f"LOCKING {hold_time:.1f}/3.0s",
+                                    f"LOCKING {hold_time:.1f}/{PHOTO_LOCK_SECONDS:.1f}s",
                                     (10, 100),
                                     cv2.FONT_HERSHEY_SIMPLEX,
                                     0.6,
                                     (0, 255, 255),
                                     2,
                                 )
-                                if not tracker_state["photo_taken"] and hold_time >= 3.0:
+                                if (
+                                    not tracker_state["photo_taken"]
+                                    and hold_time >= PHOTO_LOCK_SECONDS
+                                ):
                                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                                     filename = (
                                         f"block_{current_target_index + 1}_"
@@ -1158,19 +1354,46 @@ def main() -> None:
                                         tracker_state["photo_taken"] = False
                                         moving_to_next_face = True
                                         transition_phase = "NAVIGATE"
+                                        transition_waypoints = build_tower_transition_waypoints(
+                                            current_target_id,
+                                            next_target_id,
+                                        )
+                                        transition_waypoint_index = 0
+                                        tracker_state["waypoint_key"] = None
+                                        tracker_state["waypoint_start_ts"] = None
+                                        acquire_start_ts = None
                                         transition_mode = TRANSITION_MODES[
                                             current_target_index - 1
                                         ]
                                         print(
                                             f"Moving to target ID: {next_target_id} "
-                                            f"mode: {transition_mode}"
+                                            f"mode: {transition_mode} "
+                                            f"waypoints: {len(transition_waypoints)}"
                                         )
                         else:
                             tracker_state["lock_start_ts"] = None
                 else:
-                    # 拍完一面後，持續右移加左轉繞塔找下一面；初始搜尋則原地掃描。
                     if moving_to_next_face and transition_phase == "ACQUIRE":
-                        reacquiring, reacquire_cmd = False, None
+                        if acquire_start_ts is None:
+                            acquire_start_ts = time.monotonic()
+                        search_cmd = search_for_transition_target(
+                            tello,
+                            transition_mode,
+                            acquire_start_ts,
+                        )
+                        search_message = (
+                            f"ACQUIRE ID {current_target_id} rc:{search_cmd}"
+                        )
+                    elif moving_to_next_face and transition_phase == "NAVIGATE":
+                        search_cmd = continue_navigation_blind(
+                            tello,
+                            tracker_state,
+                            transition_mode,
+                        )
+                        search_message = (
+                            f"NAV LOST wp:{transition_waypoint_index + 1} "
+                            f"rc:{search_cmd}"
+                        )
                     else:
                         reacquiring, reacquire_cmd = reacquire_lost_marker(
                             tello,
@@ -1178,31 +1401,14 @@ def main() -> None:
                             DISPLAY_WIDTH,
                             DISPLAY_HEIGHT,
                         )
-                    if reacquiring:
-                        search_message = (
-                            f"REACQUIRE ID {tracker_state['last_seen_marker_id']} "
-                            f"rc:{reacquire_cmd}"
-                        )
-                    else:
-                        if moving_to_next_face:
-                            if transition_mode == "DOWN":
-                                tello.send_rc_control(0, 0, SAME_FACE_DOWN_SPEED, 0)
-                            elif transition_mode == "UP":
-                                tello.send_rc_control(0, 0, SAME_FACE_UP_SPEED, 0)
-                            else:
-                                tello.send_rc_control(
-                                    TARGET_ACQUIRE_RIGHT_SPEED
-                                    if transition_phase == "ACQUIRE"
-                                    else NEXT_FACE_RIGHT_SPEED,
-                                    0,
-                                    0,
-                                    TARGET_ACQUIRE_YAW_SPEED
-                                    if transition_phase == "ACQUIRE"
-                                    else NEXT_FACE_LEFT_YAW_SPEED,
-                                )
+                        if reacquiring:
+                            search_message = (
+                                f"REACQUIRE ID {tracker_state['last_seen_marker_id']} "
+                                f"rc:{reacquire_cmd}"
+                            )
                         else:
                             tello.send_rc_control(0, 0, 0, SEARCH_YAW_SPEED)
-                        search_message = f"SEARCHING ID {current_target_id} {transition_mode}..."
+                            search_message = f"SEARCHING ID {current_target_id}..."
                     cv2.putText(
                         frame,
                         search_message,
@@ -1214,7 +1420,7 @@ def main() -> None:
                     )
 
                     # 遺失目標 marker 就重置鎖定狀態，但保留已拍照資訊。
-                    reset_tracker_state(tracker_state)
+                    reset_tracker_state(tracker_state, preserve_command=True)
 
             elif is_flying and auto_track and inspection_done:
                 tello.send_rc_control(0, 0, 0, 0)
@@ -1238,6 +1444,9 @@ def main() -> None:
                     moving_to_next_face = False
                     transition_mode = "SCAN"
                     transition_phase = "SCAN"
+                    transition_waypoints = []
+                    transition_waypoint_index = 0
+                    acquire_start_ts = None
                     reset_tracker_state(tracker_state)
                     tracker_state["photo_taken"] = False
                     print("Takeoff complete. Auto mode enabled.")
@@ -1250,6 +1459,9 @@ def main() -> None:
                         moving_to_next_face = False
                         transition_mode = "SCAN"
                         transition_phase = "SCAN"
+                        transition_waypoints = []
+                        transition_waypoint_index = 0
+                        acquire_start_ts = None
                     tello.send_rc_control(0, 0, 0, 0)
                     print(f"Switched to {'AUTO' if auto_track else 'MANUAL'} mode.")
 
@@ -1277,6 +1489,9 @@ def main() -> None:
                 moving_to_next_face = False
                 transition_mode = "SCAN"
                 transition_phase = "SCAN"
+                transition_waypoints = []
+                transition_waypoint_index = 0
+                acquire_start_ts = None
                 tello.send_rc_control(0, 0, 0, 0)
                 if is_flying:
                     tello.land()
