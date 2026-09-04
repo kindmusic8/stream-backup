@@ -12,8 +12,24 @@ PHOTO_LOCK_SECONDS = 0.5
 PHOTO_LOCK_LOSS_GRACE_SEC = 0.3
 # 若畫面顏色正常可改成 False；若黃變藍請維持 True
 FRAME_IS_RGB = True
-TARGET_MARKER_IDS = [0, 4, 5, 1, 2, 6, 7, 3]
-TRANSITION_MODES = ["DOWN", "NEXT", "UP", "NEXT", "DOWN", "NEXT", "UP"]
+TARGET_MARKER_IDS = [0, 4, 5, 1, 2, 6, 12, 8, 9, 13, 14, 10, 16, 15, 7, 3]
+TRANSITION_MODES = [
+    "DOWN",
+    "NEXT",
+    "UP",
+    "NEXT",
+    "DOWN",
+    "BRIDGE_ROTATE",
+    "UP",
+    "NEXT",
+    "DOWN",
+    "NEXT",
+    "UP",
+    "NEXT",
+    "DOWN",
+    "BRIDGE_RIGHT",
+    "UP",
+]
 USE_POSE_CONTROL = True
 SEARCH_YAW_SPEED = -20
 REACQUIRE_MAX_AGE_SEC = 1.2
@@ -37,6 +53,7 @@ TARGET_Y_CM = 0.0
 TARGET_Z_CM = 80.0
 TOWER_FRONT_BACK_WIDTH_CM = 33.0
 TOWER_LEFT_RIGHT_WIDTH_CM = 25.0
+SECOND_TOWER_CENTER_Z_CM = 185.0
 TOWER_UPPER_MARKER_Y_CM = 94.0
 TOWER_LOWER_MARKER_Y_CM = 27.5
 TOWER_DISPLAY_X_SIGN = 1.0
@@ -55,6 +72,8 @@ TOWER_YAW_SIGN = -1  # 塔座標角度逆時針為正；Tello RC yaw 的正方�
 TOWER_UD_SIGN = 1  # 塔座標 Y 向上為正，與 Tello RC up/down 相同。
 TARGET_ACQUIRE_YAW_SPEED = 8
 TARGET_ACQUIRE_VERTICAL_SPEED = 8
+BRIDGE_ROTATE_YAW_SPEED = 16
+BRIDGE_RIGHT_ACQUIRE_SPEED = 8
 NAVIGATION_BLIND_MAX_SEC = 0.6
 DEAD_RECKONING_MAX_CONTROL_SEC = 6.0
 DEAD_RECKONING_MAX_STEP_SEC = 0.5
@@ -133,60 +152,104 @@ load_camera_calibration()
 def _build_tower_marker_map():
     half_front_width = TOWER_FRONT_BACK_WIDTH_CM / 2.0
     half_side_width = TOWER_LEFT_RIGHT_WIDTH_CM / 2.0
-    face_defs = {
+    local_face_defs = {
         1: {
             "center_x": 0.0,
             "center_z": -half_side_width,
             "normal_deg": -90.0,
-            "upper_id": 0,
-            "lower_id": 4,
+            "upper_offset": 0,
+            "lower_offset": 4,
             "width_cm": TOWER_FRONT_BACK_WIDTH_CM,
         },
         2: {
             "center_x": half_front_width,
             "center_z": 0.0,
             "normal_deg": 0.0,
-            "upper_id": 1,
-            "lower_id": 5,
+            "upper_offset": 1,
+            "lower_offset": 5,
             "width_cm": TOWER_LEFT_RIGHT_WIDTH_CM,
         },
         3: {
             "center_x": 0.0,
             "center_z": half_side_width,
             "normal_deg": 90.0,
-            "upper_id": 2,
-            "lower_id": 6,
+            "upper_offset": 2,
+            "lower_offset": 6,
             "width_cm": TOWER_FRONT_BACK_WIDTH_CM,
         },
         4: {
             "center_x": -half_front_width,
             "center_z": 0.0,
             "normal_deg": 180.0,
-            "upper_id": 3,
-            "lower_id": 7,
+            "upper_offset": 3,
+            "lower_offset": 7,
             "width_cm": TOWER_LEFT_RIGHT_WIDTH_CM,
         },
     }
+    tower_defs = (
+        {"tower_id": 1, "id_offset": 0, "center_x": 0.0, "center_z": 0.0},
+        {
+            "tower_id": 2,
+            "id_offset": 8,
+            "center_x": 0.0,
+            "center_z": SECOND_TOWER_CENTER_Z_CM,
+        },
+    )
 
     marker_map = {}
-    for face_index, face in face_defs.items():
-        for row_name, marker_id, vertical_cm in (
-            ("UP", face["upper_id"], TOWER_UPPER_MARKER_Y_CM),
-            ("DOWN", face["lower_id"], TOWER_LOWER_MARKER_Y_CM),
-        ):
-            marker_map[marker_id] = {
-                "face": face_index,
-                "row": row_name,
-                "x_cm": face["center_x"],
-                "z_cm": face["center_z"],
-                "vertical_cm": vertical_cm,
-                "normal_deg": face["normal_deg"],
-                "width_cm": face["width_cm"],
-            }
+    for tower in tower_defs:
+        for face_index, face in local_face_defs.items():
+            for row_name, marker_offset, vertical_cm in (
+                ("UP", face["upper_offset"], TOWER_UPPER_MARKER_Y_CM),
+                ("DOWN", face["lower_offset"], TOWER_LOWER_MARKER_Y_CM),
+            ):
+                marker_id = tower["id_offset"] + marker_offset
+                marker_map[marker_id] = {
+                    "tower_id": tower["tower_id"],
+                    "tower_center_x_cm": tower["center_x"],
+                    "tower_center_z_cm": tower["center_z"],
+                    "face": face_index,
+                    "row": row_name,
+                    "x_cm": tower["center_x"] + face["center_x"],
+                    "z_cm": tower["center_z"] + face["center_z"],
+                    "vertical_cm": vertical_cm,
+                    "normal_deg": face["normal_deg"],
+                    "width_cm": face["width_cm"],
+                }
+
+    # 第二座塔第 4 面上排的 ID 11 已更換為 ID 16。
+    marker_map[16] = marker_map.pop(11)
     return marker_map
 
 
 TOWER_MARKER_MAP = _build_tower_marker_map()
+BRIDGE_LOCALIZATION_MARKER_IDS = {
+    "BRIDGE_ROTATE": {2, 6, 8, 12},
+    "BRIDGE_RIGHT": {3, 7, 15, 16},
+}
+
+
+def marker_allowed_for_localization(
+    marker_id,
+    current_target_id,
+    moving_to_next_face,
+    transition_mode,
+):
+    if marker_id not in TOWER_MARKER_MAP:
+        return False
+    if not moving_to_next_face:
+        return True
+
+    bridge_marker_ids = BRIDGE_LOCALIZATION_MARKER_IDS.get(transition_mode)
+    if bridge_marker_ids is not None:
+        return marker_id in bridge_marker_ids
+
+    marker_info = TOWER_MARKER_MAP[marker_id]
+    target_info = TOWER_MARKER_MAP.get(current_target_id)
+    return (
+        target_info is not None
+        and marker_info["tower_id"] == target_info["tower_id"]
+    )
 
 
 class PIDController:
@@ -358,8 +421,36 @@ def build_tower_transition_waypoints(from_marker_id, to_marker_id):
     if from_info is None or to_info is None or target is None:
         return []
 
-    if from_info["face"] == to_info["face"]:
+    if (from_marker_id, to_marker_id) == (6, 12):
+        return [
+            dict(
+                target,
+                label="BRIDGE TURN",
+                forced_yaw_sign=-1,
+                forced_yaw_speed=BRIDGE_ROTATE_YAW_SPEED,
+                position_tolerance_cm=TOWER_ARC_TOLERANCE_CM,
+                vertical_tolerance_cm=TOWER_ARC_VERTICAL_TOLERANCE_CM,
+                heading_tolerance_deg=TOWER_ARC_HEADING_TOLERANCE_DEG,
+            )
+        ]
+
+    if (from_marker_id, to_marker_id) == (15, 7):
+        return [
+            dict(
+                target,
+                label="BRIDGE RIGHT",
+                position_tolerance_cm=TOWER_ARC_TOLERANCE_CM,
+                vertical_tolerance_cm=TOWER_ARC_VERTICAL_TOLERANCE_CM,
+                heading_tolerance_deg=TOWER_ARC_HEADING_TOLERANCE_DEG,
+            )
+        ]
+
+    same_tower = from_info["tower_id"] == to_info["tower_id"]
+    if same_tower and from_info["face"] == to_info["face"]:
         return [dict(target, label="SAME")]
+
+    if not same_tower:
+        return [dict(target, label="DIRECT")]
 
     next_face = from_info["face"] % 4 + 1
     if to_info["face"] != next_face:
@@ -377,7 +468,9 @@ def build_tower_transition_waypoints(from_marker_id, to_marker_id):
     end_angle = start_angle + 90.0
     start_y = from_info["vertical_cm"]
     end_y = to_info["vertical_cm"]
-    corner_x, corner_z = corner_by_face[from_info["face"]]
+    local_corner_x, local_corner_z = corner_by_face[from_info["face"]]
+    corner_x = from_info["tower_center_x_cm"] + local_corner_x
+    corner_z = from_info["tower_center_z_cm"] + local_corner_z
 
     waypoints = []
     for index, fraction in enumerate((0.25, 0.75)):
@@ -1029,10 +1122,18 @@ def fly_tower_waypoint(tello, tower_pose, target_position, state):
         and abs(error_z) <= position_tolerance
     )
     if abs(heading_error) > heading_tolerance:
-        yaw_velocity = TOWER_YAW_SIGN * _rc_speed(
+        yaw_output = _rc_speed(
             pids["yaw"].update(heading_error, dt) * TOWER_WAYPOINT_YAW_SCALE,
             min_speed=6,
         )
+        forced_yaw_sign = target_position.get("forced_yaw_sign")
+        if forced_yaw_sign is None:
+            yaw_velocity = TOWER_YAW_SIGN * yaw_output
+        else:
+            forced_yaw_speed = target_position.get("forced_yaw_speed")
+            if forced_yaw_speed is None:
+                forced_yaw_speed = abs(yaw_output)
+            yaw_velocity = int(np.sign(forced_yaw_sign) * forced_yaw_speed)
     else:
         pids["yaw"].reset()
 
@@ -1081,14 +1182,18 @@ def search_for_transition_target(tello, transition_mode, acquire_start_ts, state
     sweep_phase = elapsed % 3.2
     sweep_sign = 1 if sweep_phase < 1.2 or sweep_phase >= 2.4 else -1
 
-    if transition_mode in ("DOWN", "UP"):
+    if transition_mode == "BRIDGE_ROTATE":
+        command = (0, 0, 0, -BRIDGE_ROTATE_YAW_SPEED)
+    elif transition_mode == "BRIDGE_RIGHT":
+        command = (BRIDGE_RIGHT_ACQUIRE_SPEED, 0, 0, 0)
+    elif transition_mode in ("DOWN", "UP"):
         primary_sign = -1 if transition_mode == "DOWN" else 1
         up_down_velocity = (
             primary_sign * sweep_sign * TARGET_ACQUIRE_VERTICAL_SPEED
         )
         command = (0, 0, up_down_velocity, 0)
     else:
-        # 下一面一定在左旋方向，避免已到定位點後又向右轉回上一面。
+        # 一般 NEXT 固定左旋，避免轉回剛拍完的面。
         yaw_velocity = -TARGET_ACQUIRE_YAW_SPEED
         command = (0, 0, 0, yaw_velocity)
 
@@ -1342,6 +1447,14 @@ def main() -> None:
                 pose_rvec,
                 pose_tvec,
             )
+            if tower_pose is not None and not marker_allowed_for_localization(
+                marker_id,
+                current_target_id,
+                moving_to_next_face,
+                transition_mode,
+            ):
+                marker_id = None
+                tower_pose = None
             loop_now = time.monotonic()
             predict_tower_pose(
                 pose_estimator,
