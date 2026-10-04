@@ -10,6 +10,7 @@ from datetime import datetime
 PHOTO_DIR = "photos"
 PHOTO_LOCK_SECONDS = 0.5
 PHOTO_LOCK_LOSS_GRACE_SEC = 0.3
+HOME_MARKER_ID = 0
 # 若畫面顏色正常可改成 False；若黃變藍請維持 True
 FRAME_IS_RGB = True
 TARGET_MARKER_IDS = [0, 4, 5, 1, 2, 6, 12, 8, 9, 13, 14, 10, 16, 15, 7, 3]
@@ -66,13 +67,14 @@ TOWER_ARC_HEADING_TOLERANCE_DEG = 18.0
 TOWER_WAYPOINT_SOFT_TIMEOUT_SEC = 6.0
 TOWER_WAYPOINT_SOFT_DISTANCE_CM = 28.0
 TOWER_WAYPOINT_SOFT_HEADING_DEG = 30.0
-TOWER_WAYPOINT_YAW_SCALE = 0.50
+TOWER_WAYPOINT_YAW_SCALE = 1.0
+TOWER_WAYPOINT_MAX_YAW_SPEED = 24
 TOWER_WAYPOINT_UD_BOOST = 1.5
 TOWER_YAW_SIGN = -1  # 塔座標角度逆時針為正；Tello RC yaw 的正方向相反。
 TOWER_UD_SIGN = 1  # 塔座標 Y 向上為正，與 Tello RC up/down 相同。
-TARGET_ACQUIRE_YAW_SPEED = 8
+TARGET_ACQUIRE_YAW_SPEED = 20
 TARGET_ACQUIRE_VERTICAL_SPEED = 8
-BRIDGE_ROTATE_YAW_SPEED = 16
+BRIDGE_ROTATE_YAW_SPEED = 32
 BRIDGE_RIGHT_ACQUIRE_SPEED = 8
 NAVIGATION_BLIND_MAX_SEC = 0.6
 DEAD_RECKONING_MAX_CONTROL_SEC = 6.0
@@ -105,48 +107,6 @@ CAMERA_MATRIX = np.array(
     dtype=np.float32,
 )
 DIST_COEFFS = np.zeros((5, 1), dtype=np.float32)
-CALIBRATION_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "camera_calibration.npz",
-)
-
-
-def load_camera_calibration():
-    global CAMERA_MATRIX, DIST_COEFFS
-
-    if not os.path.exists(CALIBRATION_FILE):
-        print("Camera calibration file not found; using estimated intrinsics.")
-        return
-
-    try:
-        with np.load(CALIBRATION_FILE) as calibration:
-            camera_matrix = calibration["camera_matrix"].astype(np.float32)
-            dist_coeffs = calibration["dist_coeffs"].astype(np.float32)
-            calibrated_width, calibrated_height = calibration["image_size"]
-            rms = (
-                float(calibration["rms"])
-                if "rms" in calibration
-                else float("nan")
-            )
-
-        scale_x = DISPLAY_WIDTH / float(calibrated_width)
-        scale_y = DISPLAY_HEIGHT / float(calibrated_height)
-        camera_matrix[0, 0] *= scale_x
-        camera_matrix[0, 2] *= scale_x
-        camera_matrix[1, 1] *= scale_y
-        camera_matrix[1, 2] *= scale_y
-
-        CAMERA_MATRIX = camera_matrix
-        DIST_COEFFS = dist_coeffs
-        print(
-            f"Loaded camera calibration: {CALIBRATION_FILE} "
-            f"(RMS {rms:.4f}px)"
-        )
-    except (KeyError, OSError, ValueError) as error:
-        print(f"Camera calibration could not be loaded: {error}")
-
-
-load_camera_calibration()
 
 
 def _build_tower_marker_map():
@@ -279,7 +239,7 @@ class PIDController:
         return float(np.clip(output, -self.output_limit, self.output_limit))
 
 
-def _rc_speed(value, min_speed=MIN_AUTO_SPEED):
+def _rc_speed(value, min_speed=MIN_AUTO_SPEED, max_speed=MAX_AUTO_SPEED):
     speed = int(round(value))
     if speed == 0:
         return 0
@@ -287,7 +247,7 @@ def _rc_speed(value, min_speed=MIN_AUTO_SPEED):
     if abs(speed) < min_speed:
         speed = min_speed if speed > 0 else -min_speed
 
-    return int(np.clip(speed, -MAX_AUTO_SPEED, MAX_AUTO_SPEED))
+    return int(np.clip(speed, -max_speed, max_speed))
 
 
 def _low_pass(previous, current, alpha=0.25):
@@ -1123,8 +1083,10 @@ def fly_tower_waypoint(tello, tower_pose, target_position, state):
     )
     if abs(heading_error) > heading_tolerance:
         yaw_output = _rc_speed(
-            pids["yaw"].update(heading_error, dt) * TOWER_WAYPOINT_YAW_SCALE,
+            pids["waypoint_yaw"].update(heading_error, dt)
+            * TOWER_WAYPOINT_YAW_SCALE,
             min_speed=6,
+            max_speed=TOWER_WAYPOINT_MAX_YAW_SPEED,
         )
         forced_yaw_sign = target_position.get("forced_yaw_sign")
         if forced_yaw_sign is None:
@@ -1135,7 +1097,7 @@ def fly_tower_waypoint(tello, tower_pose, target_position, state):
                 forced_yaw_speed = abs(yaw_output)
             yaw_velocity = int(np.sign(forced_yaw_sign) * forced_yaw_speed)
     else:
-        pids["yaw"].reset()
+        pids["waypoint_yaw"].reset()
 
     if now - state["last_cmd_ts"] >= 0.08:
         command = (
@@ -1293,6 +1255,144 @@ def safe_shutdown_tello(tello, is_flying):
         pass
 
 
+def _draw_translucent_panel(frame, top, bottom, color=(18, 22, 28), alpha=0.78):
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, top), (frame.shape[1], bottom), color, -1)
+    cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0.0, frame)
+
+
+def _put_fitted_text(
+    frame,
+    text,
+    origin,
+    max_width,
+    scale=0.5,
+    color=(245, 245, 245),
+    thickness=1,
+):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fitted_scale = scale
+    while fitted_scale > 0.32:
+        width = cv2.getTextSize(text, font, fitted_scale, thickness)[0][0]
+        if width <= max_width:
+            break
+        fitted_scale -= 0.03
+    cv2.putText(
+        frame,
+        text,
+        origin,
+        font,
+        fitted_scale,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
+def draw_flight_hud(
+    frame,
+    mode_name,
+    progress_text,
+    target_id,
+    battery_percent,
+    estimated_tower_pose,
+    pose_source,
+    pose_color,
+    action_title,
+    action_detail,
+    action_color,
+):
+    width, height = frame.shape[1], frame.shape[0]
+    _draw_translucent_panel(frame, 0, 61)
+    _draw_translucent_panel(frame, height - 57, height)
+
+    mode_color = (255, 210, 70) if mode_name == "AUTO" else (80, 190, 255)
+    cv2.rectangle(frame, (0, 0), (4, 61), mode_color, -1)
+    header = f"{mode_name}  {progress_text}  ID {target_id}"
+    _put_fitted_text(frame, header, (10, 20), width - 105, 0.5, mode_color, 1)
+
+    if battery_percent is None:
+        battery_text = "--%"
+        battery_level = 0.0
+        battery_color = (150, 150, 150)
+    else:
+        battery_value = int(np.clip(battery_percent, 0, 100))
+        battery_text = f"{battery_value}%"
+        battery_level = battery_value / 100.0
+        if battery_value <= 20:
+            battery_color = (70, 70, 255)
+        elif battery_value <= 40:
+            battery_color = (40, 190, 255)
+        else:
+            battery_color = (90, 220, 120)
+
+    cv2.putText(
+        frame,
+        battery_text,
+        (width - 76, 19),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.43,
+        battery_color,
+        1,
+        cv2.LINE_AA,
+    )
+    battery_left = width - 37
+    cv2.rectangle(frame, (battery_left, 8), (width - 8, 20), (190, 190, 190), 1)
+    cv2.rectangle(frame, (width - 7, 11), (width - 5, 17), (190, 190, 190), -1)
+    fill_width = int(25 * battery_level)
+    if fill_width > 0:
+        cv2.rectangle(
+            frame,
+            (battery_left + 2, 10),
+            (battery_left + 2 + fill_width, 18),
+            battery_color,
+            -1,
+        )
+
+    if estimated_tower_pose is None:
+        coordinate_text = "POS --   SHOW A TOWER MARKER"
+    else:
+        coordinate_text = (
+            f"{pose_source}  "
+            f"X {estimated_tower_pose['display_tower_x_cm']:.0f}  "
+            f"Y {estimated_tower_pose['tower_y_cm']:.0f}  "
+            f"Z {estimated_tower_pose['tower_z_cm']:.0f}  "
+            f"H {estimated_tower_pose['heading_deg']:.0f}"
+        )
+    _put_fitted_text(frame, coordinate_text, (10, 48), width - 20, 0.48, pose_color, 1)
+
+    action_top = height - 57
+    cv2.rectangle(frame, (0, action_top), (4, height), action_color, -1)
+    cv2.putText(
+        frame,
+        "ACTION",
+        (10, action_top + 15),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.34,
+        (170, 180, 190),
+        1,
+        cv2.LINE_AA,
+    )
+    _put_fitted_text(
+        frame,
+        action_title,
+        (63, action_top + 16),
+        width - 73,
+        0.5,
+        action_color,
+        1,
+    )
+    _put_fitted_text(
+        frame,
+        action_detail,
+        (10, height - 10),
+        width - 20,
+        0.42,
+        (235, 238, 242),
+        1,
+    )
+
+
 def main() -> None:
     os.makedirs(PHOTO_DIR, exist_ok=True)
     # 靜音 djitellopy 的 INFO 日誌（例如 rc 指令輸出）
@@ -1308,6 +1408,7 @@ def main() -> None:
     target_takeoff_up_cm = 50
     current_target_index = 0
     inspection_done = False
+    returning_home = False
     moving_to_next_face = False
     transition_mode = "SCAN"
     transition_phase = "SCAN"
@@ -1346,6 +1447,11 @@ def main() -> None:
             "y": PIDController(kp=0.45, kd=0.02),
             "z": PIDController(kp=0.35, kd=0.02),
             "yaw": PIDController(kp=0.7, kd=0.03),
+            "waypoint_yaw": PIDController(
+                kp=0.7,
+                kd=0.03,
+                output_limit=TOWER_WAYPOINT_MAX_YAW_SPEED,
+            ),
         },
     }
     pose_estimator = {
@@ -1381,8 +1487,14 @@ def main() -> None:
         print(f"Inspection marker IDs: {TARGET_MARKER_IDS}")
 
         while True:
-            safe_target_index = min(current_target_index, len(TARGET_MARKER_IDS) - 1)
-            current_target_id = TARGET_MARKER_IDS[safe_target_index]
+            if returning_home:
+                current_target_id = HOME_MARKER_ID
+            else:
+                safe_target_index = min(
+                    current_target_index,
+                    len(TARGET_MARKER_IDS) - 1,
+                )
+                current_target_id = TARGET_MARKER_IDS[safe_target_index]
             raw_frame = frame_reader.frame
             if raw_frame is None:
                 if should_exit():
@@ -1484,62 +1596,45 @@ def main() -> None:
                 thickness=2,
             )
 
-            # marker 可見時顯示絕對定位，否則顯示 RC 航位推算。
+            # HUD 資料：marker 可見時顯示絕對定位，否則顯示 RC 航位推算。
             if estimated_tower_pose is not None:
                 if tower_pose is not None:
-                    source_text = f"M{marker_id}"
+                    pose_source = f"M{marker_id}"
                     pose_color = (0, 255, 0)
                 else:
-                    source_text = f"DR{estimate_age:.1f}s"
+                    pose_source = f"DR {estimate_age:.1f}s"
                     pose_color = (0, 165, 255)
-                tower_text = (
-                    f"T:{estimated_tower_pose['display_tower_x_cm']:.0f},"
-                    f"{estimated_tower_pose['tower_y_cm']:.0f},"
-                    f"{estimated_tower_pose['tower_z_cm']:.0f}"
-                )
-                heading_text = f"H:{estimated_tower_pose['heading_deg']:.0f}"
-                cv2.putText(
-                    frame,
-                    f"{source_text} {tower_text} {heading_text}",
-                    (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    pose_color,
-                    2,
-                )
             else:
-                cv2.putText(
-                    frame,
-                    "T:N/A - show any tower marker",
-                    (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 0, 255),
-                    2,
-                )
+                pose_source = "--"
+                pose_color = (80, 80, 255)
 
             mode_name = "AUTO" if auto_track else "MANUAL"
-            face_text = "DONE" if inspection_done else f"{current_target_index + 1}/{len(TARGET_MARKER_IDS)}"
+            if returning_home:
+                face_text = "HOME"
+            elif inspection_done:
+                face_text = "DONE"
+            else:
+                face_text = (
+                    f"{current_target_index + 1}/{len(TARGET_MARKER_IDS)}"
+                )
             search_text = transition_phase if moving_to_next_face else "SCAN"
             if transition_phase == "NAVIGATE" and transition_waypoints:
                 search_text = (
                     f"NAV {transition_waypoint_index + 1}/"
                     f"{len(transition_waypoints)}"
                 )
-            battery_text = "B:--%" if battery_percent is None else f"B:{battery_percent}%"
-            status_text = (
-                f"{mode_name} {face_text} ID:{current_target_id} "
-                f"{search_text} {battery_text}"
-            )
-            cv2.putText(
-                frame,
-                status_text,
-                (10, 50),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 255, 0),
-                2,
-            )
+            progress_text = f"{face_text} {search_text}"
+            action_title = "READY FOR TAKEOFF"
+            action_detail = "Drone connected - awaiting takeoff"
+            action_color = (90, 220, 120)
+            if is_flying and not auto_track:
+                action_title = "MANUAL CONTROL"
+                action_detail = "Pilot has control"
+                action_color = (80, 190, 255)
+            elif inspection_done:
+                action_title = "MISSION COMPLETE"
+                action_detail = "Inspection finished"
+                action_color = (90, 220, 120)
 
             real_marker_id = marker_id
             navigating_with_dead_reckoning = False
@@ -1594,7 +1689,9 @@ def main() -> None:
                             tracker_state,
                         )
                         if waypoint_errors is None:
-                            control_text = "TOWER waypoint waiting"
+                            action_title = "WAITING FOR POSITION"
+                            action_detail = "Show a valid tower marker"
+                            action_color = (80, 80, 255)
                         else:
                             (
                                 err_x,
@@ -1609,22 +1706,32 @@ def main() -> None:
                                 if navigating_with_dead_reckoning
                                 else f"M{real_marker_id}"
                             )
-                            control_text = (
-                                f"{localization_text} "
-                                f"{target_position.get('label', 'WP')} "
-                                f"e:{err_x:.0f},{err_y:.0f},{err_z:.0f} "
-                                f"h:{heading_error:.0f}"
+                            waypoint_label = target_position.get("label", "WAYPOINT")
+                            if returning_home:
+                                action_title = f"RETURN HOME - {waypoint_label}"
+                            elif waypoint_label == "BRIDGE TURN":
+                                action_title = "TURN LEFT TO TOWER 2"
+                            elif waypoint_label == "BRIDGE RIGHT":
+                                action_title = "MOVE RIGHT TO TOWER 1"
+                            elif waypoint_label.startswith("ARC"):
+                                action_title = f"CHANGE FACE - {waypoint_label}"
+                            elif waypoint_label == "FACE":
+                                action_title = f"APPROACH ID {current_target_id}"
+                            elif waypoint_label == "SAME":
+                                action_title = f"MOVE TO ID {current_target_id}"
+                            else:
+                                action_title = f"NAVIGATE - {waypoint_label}"
+                            action_detail = (
+                                f"{localization_text}  ERR X {err_x:.0f}  "
+                                f"Y {err_y:.0f}  Z {err_z:.0f}  H {heading_error:.0f}"
                             )
-                        cv2.putText(
-                            frame,
-                            control_text,
-                            (10, 75),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.55,
-                            (255, 255, 255),
-                            2,
-                        )
+                            action_color = (255, 210, 70)
                         if waypoint_reached:
+                            action_title = "WAYPOINT REACHED"
+                            action_detail = (
+                                f"Next step for ID {current_target_id}"
+                            )
+                            action_color = (90, 220, 120)
                             transition_waypoint_index += 1
                             reset_tracker_state(tracker_state)
                             if transition_waypoint_index < len(transition_waypoints):
@@ -1640,15 +1747,6 @@ def main() -> None:
                                     acquire_start_ts,
                                     tracker_state,
                                 )
-                            cv2.putText(
-                                frame,
-                                f"WP {transition_waypoint_index}/{len(transition_waypoints)}",
-                                (10, 100),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.55,
-                                (0, 165, 255),
-                                2,
-                            )
                     else:
                         moving_to_next_face = False
                         transition_mode = "SCAN"
@@ -1668,24 +1766,26 @@ def main() -> None:
                                 tracker_state,
                             )
                             if pose_errors is None:
-                                control_text = "pose control: waiting for solvePnP"
+                                action_title = "WAITING FOR MARKER POSE"
+                                action_detail = f"Target ID {current_target_id}"
+                                action_color = (80, 80, 255)
                             else:
                                 body_lr_cm, ey_cm, body_fb_cm, eyaw_deg = pose_errors
                                 if abs(error_y) > XY_LOCK_TOLERANCE:
-                                    control_text = (
-                                        f"VERTICAL ex:{error_x} ey:{error_y} "
-                                        f"body fb:{body_fb_cm:.1f}"
-                                    )
+                                    action_title = "ALIGN HEIGHT"
                                 elif abs(error_x) >= X_EDGE_GUARD:
-                                    control_text = (
-                                        f"EDGE GUARD ex:{error_x} ey:{error_y} "
-                                        f"body lr:{body_lr_cm:.1f}"
-                                    )
+                                    action_title = "KEEP MARKER IN VIEW"
                                 else:
-                                    control_text = (
-                                        f"body lr:{body_lr_cm:.1f} y:{ey_cm:.1f} "
-                                        f"fb:{body_fb_cm:.1f} yaw:{eyaw_deg:.1f}"
+                                    action_title = (
+                                        "ALIGN HOME POSITION"
+                                        if returning_home
+                                        else f"ALIGN ID {current_target_id} FOR PHOTO"
                                     )
+                                action_detail = (
+                                    f"LR {body_lr_cm:.0f}  Y {ey_cm:.0f}  "
+                                    f"FB {body_fb_cm:.0f}  YAW {eyaw_deg:.0f}"
+                                )
+                                action_color = (80, 220, 255)
                         else:
                             filtered_area, dist_error, yaw_ok, is_locked = (
                                 track_marker_with_distance_stable(
@@ -1697,19 +1797,12 @@ def main() -> None:
                                     tracker_state,
                                 )
                             )
-                            control_text = (
-                                f"area mode f_area:{filtered_area} "
-                                f"dist_err:{dist_error} yaw_ok:{yaw_ok}"
+                            action_title = f"ALIGN ID {current_target_id} FOR PHOTO"
+                            action_detail = (
+                                f"AREA {filtered_area}  DIST {dist_error}  "
+                                f"YAW {'OK' if yaw_ok else 'ADJUST'}"
                             )
-                        cv2.putText(
-                            frame,
-                            control_text,
-                            (10, 75),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.55,
-                            (255, 255, 255),
-                            2,
-                        )
+                            action_color = (80, 220, 255)
 
                         # 只累積有效鎖定時間；短暫漏偵測由下方 grace 邏輯保留。
                         if is_locked:
@@ -1723,16 +1816,44 @@ def main() -> None:
                             tracker_state["lock_last_sample_ts"] = lock_now
                             tracker_state["lock_last_valid_ts"] = lock_now
                             hold_time = tracker_state["lock_accumulated_sec"]
-                            cv2.putText(
-                                frame,
-                                f"LOCKING {hold_time:.1f}/{PHOTO_LOCK_SECONDS:.1f}s",
-                                (10, 100),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.6,
-                                (0, 255, 255),
-                                2,
+                            action_title = (
+                                "LOCK HOME FOR LANDING"
+                                if returning_home
+                                else "HOLD STILL FOR PHOTO"
                             )
+                            action_detail = (
+                                f"LOCK {hold_time:.1f} / {PHOTO_LOCK_SECONDS:.1f} SEC"
+                            )
+                            action_color = (90, 220, 120)
                             if (
+                                returning_home
+                                and hold_time >= PHOTO_LOCK_SECONDS
+                            ):
+                                remember_rc_command(
+                                    tracker_state,
+                                    (0, 0, 0, 0),
+                                )
+                                tello.send_rc_control(0, 0, 0, 0)
+                                print("Home marker locked. Landing...")
+                                tello.land()
+                                is_flying = False
+                                auto_track = False
+                                inspection_done = True
+                                returning_home = False
+                                moving_to_next_face = False
+                                transition_mode = "SCAN"
+                                transition_phase = "DONE"
+                                transition_waypoints = []
+                                transition_waypoint_index = 0
+                                acquire_start_ts = None
+                                reset_tracker_state(tracker_state)
+                                mode_name = "MANUAL"
+                                progress_text = "DONE"
+                                action_title = "LANDED AT HOME"
+                                action_detail = "Inspection complete"
+                                action_color = (90, 220, 120)
+                                print("Inspection complete. Returned home and landed.")
+                            elif (
                                 not tracker_state["photo_taken"]
                                 and hold_time >= PHOTO_LOCK_SECONDS
                             ):
@@ -1751,14 +1872,26 @@ def main() -> None:
                                 print(f"Auto photo saved: {photo_path}")
                                 current_target_index += 1
                                 if current_target_index >= len(TARGET_MARKER_IDS):
-                                    inspection_done = True
-                                    auto_track = False
-                                    remember_rc_command(
-                                        tracker_state,
-                                        (0, 0, 0, 0),
+                                    returning_home = True
+                                    reset_tracker_state(tracker_state)
+                                    tracker_state["photo_taken"] = False
+                                    moving_to_next_face = True
+                                    transition_phase = "NAVIGATE"
+                                    transition_waypoints = (
+                                        build_tower_transition_waypoints(
+                                            current_target_id,
+                                            HOME_MARKER_ID,
+                                        )
                                     )
-                                    tello.send_rc_control(0, 0, 0, 0)
-                                    print("Inspection complete. Auto mode disabled.")
+                                    transition_waypoint_index = 0
+                                    tracker_state["waypoint_key"] = None
+                                    tracker_state["waypoint_start_ts"] = None
+                                    acquire_start_ts = None
+                                    transition_mode = "RETURN_HOME"
+                                    print(
+                                        "Inspection photos complete. "
+                                        "Returning to ID 0 for landing."
+                                    )
                                 else:
                                     next_target_id = TARGET_MARKER_IDS[current_target_index]
                                     reset_tracker_state(tracker_state)
@@ -1801,10 +1934,12 @@ def main() -> None:
                         tracker_state["lock_last_sample_ts"] = time.monotonic()
                         remember_rc_command(tracker_state, (0, 0, 0, 0))
                         tello.send_rc_control(0, 0, 0, 0)
-                        search_message = (
-                            f"LOCK HOLD {lock_loss_age:.1f}/"
-                            f"{PHOTO_LOCK_LOSS_GRACE_SEC:.1f}s"
+                        action_title = "MARKER FLICKER - HOLDING"
+                        action_detail = (
+                            f"Grace {lock_loss_age:.1f} / "
+                            f"{PHOTO_LOCK_LOSS_GRACE_SEC:.1f} sec"
                         )
+                        action_color = (40, 190, 255)
                     elif moving_to_next_face and transition_phase == "ACQUIRE":
                         if acquire_start_ts is None:
                             acquire_start_ts = time.monotonic()
@@ -1814,19 +1949,29 @@ def main() -> None:
                             acquire_start_ts,
                             tracker_state,
                         )
-                        search_message = (
-                            f"ACQUIRE ID {current_target_id} rc:{search_cmd}"
-                        )
+                        if transition_mode == "DOWN":
+                            action_title = f"SEARCH BELOW FOR ID {current_target_id}"
+                        elif transition_mode == "UP":
+                            action_title = f"SEARCH ABOVE FOR ID {current_target_id}"
+                        elif transition_mode == "BRIDGE_RIGHT":
+                            action_title = f"MOVE RIGHT - FIND ID {current_target_id}"
+                        elif returning_home:
+                            action_title = "TURN LEFT - FIND HOME ID 0"
+                        else:
+                            action_title = f"TURN LEFT - FIND ID {current_target_id}"
+                        action_detail = f"ACQUIRE  RC {search_cmd}"
+                        action_color = (40, 190, 255)
                     elif moving_to_next_face and transition_phase == "NAVIGATE":
                         search_cmd = continue_navigation_blind(
                             tello,
                             tracker_state,
                             transition_mode,
                         )
-                        search_message = (
-                            f"NAV LOST wp:{transition_waypoint_index + 1} "
-                            f"rc:{search_cmd}"
+                        action_title = "NO MARKER - CONTINUE SAFELY"
+                        action_detail = (
+                            f"WP {transition_waypoint_index + 1}  RC {search_cmd}"
                         )
+                        action_color = (40, 190, 255)
                     else:
                         reacquiring, reacquire_cmd = reacquire_lost_marker(
                             tello,
@@ -1835,26 +1980,20 @@ def main() -> None:
                             DISPLAY_HEIGHT,
                         )
                         if reacquiring:
-                            search_message = (
-                                f"REACQUIRE ID {tracker_state['last_seen_marker_id']} "
-                                f"rc:{reacquire_cmd}"
+                            action_title = (
+                                f"RECOVER ID {tracker_state['last_seen_marker_id']}"
                             )
+                            action_detail = f"Last seen direction  RC {reacquire_cmd}"
+                            action_color = (40, 190, 255)
                         else:
                             remember_rc_command(
                                 tracker_state,
                                 (0, 0, 0, SEARCH_YAW_SPEED),
                             )
                             tello.send_rc_control(0, 0, 0, SEARCH_YAW_SPEED)
-                            search_message = f"SEARCHING ID {current_target_id}..."
-                    cv2.putText(
-                        frame,
-                        search_message,
-                        (10, 75),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55,
-                        (0, 165, 255),
-                        2,
-                    )
+                            action_title = f"SEARCH FOR ID {current_target_id}"
+                            action_detail = f"Rotate left  RC yaw {SEARCH_YAW_SPEED}"
+                            action_color = (40, 190, 255)
 
                     if not holding_lock_grace:
                         # 持續遺失才取消鎖定並重新尋找 marker。
@@ -1869,6 +2008,19 @@ def main() -> None:
                 remember_rc_command(tracker_state, (0, 0, 0, 0))
                 tello.send_rc_control(0, 0, 0, 0)
 
+            draw_flight_hud(
+                frame,
+                mode_name,
+                progress_text,
+                current_target_id,
+                battery_percent,
+                estimated_tower_pose,
+                pose_source,
+                pose_color,
+                action_title,
+                action_detail,
+                action_color,
+            )
             cv2.imshow("Tello Camera", frame)
             key = cv2.waitKey(1) & 0xFF
 
@@ -1881,6 +2033,7 @@ def main() -> None:
                     auto_track = True
                     current_target_index = 0
                     inspection_done = False
+                    returning_home = False
                     moving_to_next_face = False
                     transition_mode = "SCAN"
                     transition_phase = "SCAN"
@@ -1896,6 +2049,7 @@ def main() -> None:
                 if is_flying:
                     auto_track = not auto_track
                     if not auto_track:
+                        returning_home = False
                         moving_to_next_face = False
                         transition_mode = "SCAN"
                         transition_phase = "SCAN"
@@ -1927,6 +2081,7 @@ def main() -> None:
             # l: 降落
             elif key == ord('l'):
                 auto_track = False
+                returning_home = False
                 moving_to_next_face = False
                 transition_mode = "SCAN"
                 transition_phase = "SCAN"
